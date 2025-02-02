@@ -40,9 +40,15 @@
 #   include <string.h>
 #   define FDLFCN_strcmp strcmp
 #endif
-#ifndef FDLFCN_printf
+#ifndef FDLFCN_vprintf
 #   include <stdio.h>
-#   define FDLFCN_printf printf
+#   define FDLFCN_vprintf vprintf
+#endif
+#ifdef FDLFCN_DEBUGGING_SUPPORT
+#   ifndef FDLFCN_getenv
+#       include <stdlib.h>
+#       define FDLFCN_getenv getenv
+#   endif
 #endif
 
 // Specifies `fdl_sym` to look through the currently loaded list of libraries
@@ -63,11 +69,15 @@ typedef struct fdlfcn_handle
     int text_section_index;
     int data_section_index;
     int rodata_section_index;
+    int dynamic_section_index;
+    int init_array_section_index;
+    int fini_array_section_index;
     void* string_table_data;
     void* text_section_data;
     void* data_section_data;
     void* rodata_section_data;
     void* symtab_str_section_data;
+    void* dynamic_section_data;
 
     Elf64_Shdr* text_section_header;
     Elf64_Shdr* string_table_header;

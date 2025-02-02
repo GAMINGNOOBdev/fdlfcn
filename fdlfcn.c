@@ -1,15 +1,48 @@
 #include "fdlfcn.h"
+#include <elf.h>
+#include <sys/mman.h>
+#ifdef FDLFCN_DEBUGGING_SUPPORT
+#   include <stdarg.h>
+#endif
 
-fdlfcn_handle* global_library_handles;
+fdlfcn_handle* fdl_global_library_handles = NULL;
+int fdl_debug_enabled = 0;
 
 #define READ_FROM_MEMORY(dest, base, offset, size) FDLFCN_memcpy(dest, (void*)( (uint64_t)base + (uint64_t)offset ), size)
+
+void fdl_debug(const char* fmt, ...)
+{
+    if (!fdl_debug_enabled)
+        return;
+
+    #ifdef FDLFCN_DEBUGGING_SUPPORT
+    va_list args;
+    va_start(args, fmt);
+    FDLFCN_vprintf(fmt, args);
+    va_end(args);
+    #endif
+}
+
+#ifdef FDLFCN_DEBUGGING_SUPPORT
+void fdl_initialize_debugging(void)
+{
+    if (fdl_debug_enabled)
+        return;
+    
+    const char* debug = FDLFCN_getenv("FDL_DEBUG");
+    if (debug == NULL)
+        return;
+    if (FDLFCN_strcmp(debug, "1") == 0 || FDLFCN_strcmp(debug, "true") == 0)
+        fdl_debug_enabled = 1;
+}
+#endif
 
 void* fdl_load_section(void* filedata, Elf64_Shdr* section_header, int prot)
 {
     void* section_data = FDLFCN_mmap(NULL, section_header->sh_size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (section_data == MAP_FAILED)
     {
-        FDLFCN_printf("fdl_load_section: malloc failed for section (%s:%d)\n", __FILE__, __LINE__);
+        fdl_debug("[FDL DEBUG] %s: malloc failed for section (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
         return NULL;
     }
 
@@ -18,13 +51,14 @@ void* fdl_load_section(void* filedata, Elf64_Shdr* section_header, int prot)
     return section_data;
 }
 
-int fdl_process_relocation(Elf64_Rela* reloc, Elf64_Sym* symbols, void* base_address)
+int fdl_process_relocation(fdlfcn_handle* handle, Elf64_Rela* reloc, Elf64_Sym* symbols, void* base_address)
 {
     int sym_index = ELF64_R_SYM(reloc->r_info);
     Elf64_Sym* sym = &symbols[sym_index];
     int reloc_type = ELF64_R_TYPE(reloc->r_info);
-    uintptr_t target_addr = 0;
     uintptr_t* relocation_target = (uintptr_t*)(base_address + reloc->r_offset);
+
+    char* symbol_name_str = (char*)((uint64_t)handle->symtab_str_section_data + sym->st_name);
 
     uintptr_t sym_value = 0;
     if (sym->st_shndx != SHN_UNDEF)
@@ -44,9 +78,10 @@ int fdl_process_relocation(Elf64_Rela* reloc, Elf64_Sym* symbols, void* base_add
         *relocation_target = (uintptr_t)base_address + reloc->r_addend;
     else
     {
-        FDLFCN_printf("fdl_process_relocation: Unsupported relocation type: %d\n", reloc_type);
+        fdl_debug("[FDL DEBUG] %s: Symbol '%s' has unsupported relocation type: %d (%s:%d)\n", __FUNCTION__, symbol_name_str, reloc_type, __FILE__, __LINE__);
         return -1;
     }
+    fdl_debug("[FDL DEBUG] %s: Applied relocation for symbol '%s' with address %p (%s:%d)\n", __FUNCTION__, symbol_name_str, relocation_target, __FILE__, __LINE__);
 
     return 0;
 }
@@ -65,6 +100,7 @@ int fdl_apply_relocations(fdlfcn_handle* lib, int reloc_section_index, int reloc
 
             int sym_index = ELF64_R_SYM(reloc->r_info); 
             Elf64_Sym* sym = &lib->symbols[sym_index];
+            char* symbol_name_str = (char*)((uint64_t)lib->symtab_str_section_data + sym->st_name);
 
             int reloc_type = ELF64_R_TYPE(reloc->r_info);
             uintptr_t target_addr = 0; 
@@ -79,12 +115,14 @@ int fdl_apply_relocations(fdlfcn_handle* lib, int reloc_section_index, int reloc
                 target_addr = (uintptr_t)sym->st_value; 
             else
             {
-                FDLFCN_printf("fdl_apply_relocations: Unsupported relocation type: %d: %s\n", reloc_type, __FILE__);
+                fdl_debug("[FDL DEBUG] %s: Symbol '%s' has unsupported relocation type: %d: (%s:%d)\n", __FUNCTION__, symbol_name_str, reloc_type, __FILE__, __LINE__);
                 return -1;
             }
 
             uintptr_t* ptr = (uintptr_t*)(lib->address + reloc->r_offset); 
             *ptr += target_addr + reloc->r_addend; 
+
+            fdl_debug("[FDL DEBUG] %s: Applied relocation for symbol '%s' with address %p (%s:%d)\n", __FUNCTION__, symbol_name_str, ptr, __FILE__, __LINE__);
         }
     }
 
@@ -94,9 +132,9 @@ int fdl_apply_relocations(fdlfcn_handle* lib, int reloc_section_index, int reloc
         for (int i = 0; i < num_relocations_dyn; i++)
         {
             Elf64_Rela* reloc = &lib->relocations_dyn[i];
-            if (fdl_process_relocation(reloc, lib->symbols, lib->address) != 0)
+            if (fdl_process_relocation(lib, reloc, lib->symbols, lib->address) != 0)
             {
-                FDLFCN_printf("fdl_apply_relocations: Error processing .rela.dyn relocation (%s:%d)\n", __FILE__, __LINE__);
+                fdl_debug("[FDL DEBUG] %s: Error processing .rela.dyn relocation (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
                 return -1;
             }
         }
@@ -108,9 +146,9 @@ int fdl_apply_relocations(fdlfcn_handle* lib, int reloc_section_index, int reloc
         for (int i = 0; i < num_relocations_plt; i++)
         {
             Elf64_Rela* reloc = &lib->relocations_plt[i];
-            if (fdl_process_relocation(reloc, lib->symbols, lib->address) != 0)
+            if (fdl_process_relocation(lib, reloc, lib->symbols, lib->address) != 0)
             {
-                FDLFCN_printf("fdl_apply_relocations: Error processing .rela.plt relocation (%s:%d)\n", __FILE__, __LINE__);
+                fdl_debug("[FDL DEBUG] %s: Error processing .rela.plt relocation (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
                 return -1;
             }
         }
@@ -126,12 +164,15 @@ void* fdlsym(fdlfcn_handle* handle, const char* symbol_name)
 
     if (handle == FLD_NEXT)
     {
-        for (fdlfcn_handle* entry = global_library_handles; entry != NULL; entry = entry->next)
+        fdl_debug("[FDL DEBUG] %s: Searching symbol '%s' in all loaded libraries (%s:%d)\n", __FUNCTION__, symbol_name, __FILE__, __LINE__);
+        for (fdlfcn_handle* entry = fdl_global_library_handles; entry != NULL; entry = entry->next)
         {
             void* addr = fdlsym(entry, symbol_name);
             if (addr != NULL)
                 return addr;
         }
+        fdl_debug("[FDL DEBUG] %s: Symbol '%s' not found (%s:%d)\n", __FUNCTION__, symbol_name, __FILE__, __LINE__);
+        return NULL;
     }
 
     if (handle->symbols == NULL)
@@ -143,7 +184,7 @@ void* fdlsym(fdlfcn_handle* handle, const char* symbol_name)
     for (int j = 0; j < symtab_section.sh_size / sizeof(Elf64_Sym); j++)
     {
         Elf64_Sym symbol = symbols[j];
-        char* symbol_name_str = (char*)((uint64_t)handle->symtab_str_section_data + symbol.st_name); 
+        char* symbol_name_str = (char*)((uint64_t)handle->symtab_str_section_data + symbol.st_name);
         if (FDLFCN_strcmp(symbol_name_str, symbol_name) == 0 && ELF64_ST_BIND(symbol.st_info) != STB_LOCAL && symbol.st_shndx == handle->text_section_index)
         {
             uintptr_t symbol_address = 0;
@@ -155,11 +196,14 @@ void* fdlsym(fdlfcn_handle* handle, const char* symbol_name)
                 symbol_address = (uintptr_t)handle->rodata_section_data + symbol.st_value - handle->rodata_section_header->sh_offset;
 
             if (symbol.st_shndx != SHN_UNDEF)
+            {
+                fdl_debug("[FDL DEBUG] %s: Resolved symbol '%s' at address %p in library %p (%s:%d)\n", __FUNCTION__, symbol_name, symbol_address, handle->address, __FILE__, __LINE__);
                 return (void*)symbol_address;
+            }
         }
     }
 
-    FDLFCN_printf("fdlsym: Symbol '%s' not found\n", symbol_name);
+    fdl_debug("[FDL DEBUG] %s: Symbol '%s' not found (%s:%d)\n", __FUNCTION__, symbol_name, __FILE__, __LINE__);
     return NULL;
 }
 
@@ -168,7 +212,7 @@ int fdlclose(fdlfcn_handle* handle)
     if (!handle)
         return 1;
 
-    for (fdlfcn_handle* entry = global_library_handles; entry != NULL; entry = entry->next)
+    for (fdlfcn_handle* entry = fdl_global_library_handles; entry != NULL; entry = entry->next)
     {
         if (entry != handle)
             continue;
@@ -179,10 +223,29 @@ int fdlclose(fdlfcn_handle* handle)
         if (entry->next)
             entry->next->prev = entry->prev;
 
-        if (entry == global_library_handles)
-            global_library_handles = NULL;
+        if (entry == fdl_global_library_handles)
+            fdl_global_library_handles = NULL;
 
         break;
+    }
+
+    if (handle->dynamic_section_index != -1)
+    {
+        Elf64_Dyn* dynamic_entries = handle->dynamic_section_data;
+        for (int i = 0; i < dynamic_entries[i].d_tag != DT_NULL; i++)
+        {
+            if (dynamic_entries[i].d_tag == DT_FINI)
+                ((void(*)(void))((uintptr_t)handle->address + dynamic_entries[i].d_un.d_ptr))();
+        }
+    }
+
+    if (handle->fini_array_section_index != -1)
+    {
+        Elf64_Shdr fini_array_section = handle->shdrs[handle->fini_array_section_index];
+        Elf64_Addr* fini_array = (Elf64_Addr*)((uintptr_t)handle->address + fini_array_section.sh_offset);
+        size_t count = fini_array_section.sh_size / sizeof(Elf64_Addr);
+        for (size_t i = count; i > 0; i--)
+            ((void(*)(void))fini_array[i-1])();
     }
 
     if (handle->address)
@@ -191,6 +254,8 @@ int fdlclose(fdlfcn_handle* handle)
         FDLFCN_munmap(handle->string_table_data, handle->string_table_header->sh_size);
     if (handle->symtab_str_section_data)
         FDLFCN_munmap(handle->symtab_str_section_data, handle->symtab_str_section_header->sh_size);
+    if (handle->dynamic_section_data)
+        FDLFCN_munmap(handle->dynamic_section_data, handle->shdrs[handle->dynamic_section_index].sh_size);
     if (handle->relocations)
         FDLFCN_free(handle->relocations);
     if (handle->relocations_dyn)
@@ -202,6 +267,8 @@ int fdlclose(fdlfcn_handle* handle)
     if (handle->symbols)
         FDLFCN_free(handle->symbols);
 
+    fdl_debug("[FDL DEBUG] %s: Unloaded library with address %p (%s:%d)\n", __FUNCTION__, handle->address, __FILE__, __LINE__);
+
     FDLFCN_free(handle);
 
     return 0;
@@ -212,10 +279,14 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     if (filedata == NULL || flags != FDL_IMMEDIATE)
         return NULL;
 
+    #ifdef FDLFCN_DEBUGGING_SUPPORT
+    fdl_initialize_debugging();
+    #endif
+
     fdlfcn_handle* handle = FDLFCN_malloc(sizeof(fdlfcn_handle));
     if (handle == NULL)
     {
-        FDLFCN_printf("fdlopen: Could not allocate memory for shared object file handle (%s:%d)\n", __FILE__, __LINE__);
+        fdl_debug("[FDL DEBUG] %s: Could not allocate memory for shared object file handle (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
         return NULL;
     }
     FDLFCN_memset(handle, 0, sizeof(fdlfcn_handle));
@@ -226,7 +297,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     if (FDLFCN_memcmp(&elf_header.e_ident[EI_MAG0], ELFMAG, SELFMAG) != 0 || elf_header.e_ident[EI_CLASS] != ELFCLASS64 || elf_header.e_type != ET_DYN ||
         elf_header.e_machine != EM_X86_64 || elf_header.e_version != EV_CURRENT)
     {
-        FDLFCN_printf("fdlopen: Not a valid .so file (%s:%d)\n", __FILE__, __LINE__);
+        fdl_debug("[FDL DEBUG] %s: Not a valid .so file (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
         FDLFCN_free(handle);
         return NULL;
     }
@@ -246,6 +317,9 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     int rodata_section_index = -1;
     int reloc_section_index = -1;
     int symtab_str_section_index = -1;
+    int dynamic_section_index = -1;
+    int init_array_section_index = -1;
+    int fini_array_section_index = -1;
     int rela_dyn_index = -1;
     int rela_plt_index = -1;
 
@@ -253,6 +327,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     for (int i = 0; i < elf_header.e_shnum; i++)
     {
         char* section_name = (char*)strtableAddr + section_headers[i].sh_name;
+        fdl_debug("[FDL DEBUG] %s: Found section '%s' with index %d and offset 0x%x (%s:%d)\n", __FUNCTION__, section_name, i, section_headers[i].sh_offset, __FILE__, __LINE__);
         if (FDLFCN_strcmp(section_name, ".text") == 0)
             text_section_index = i;
         else if (FDLFCN_strcmp(section_name, ".data") == 0)
@@ -262,9 +337,15 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
         else if (FDLFCN_strcmp(section_name, ".symtab") == 0)
             symtab_index = i;
         else if (FDLFCN_strcmp(section_name, ".strtab") == 0)
-            strtab_index = i; 
+            strtab_index = i;
         else if (FDLFCN_strcmp(section_name, ".reloc") == 0)
             reloc_section_index = i;
+        else if (FDLFCN_strcmp(section_name, ".init_array") == 0)
+            init_array_section_index = i;
+        else if (FDLFCN_strcmp(section_name, ".fini_array") == 0)
+            fini_array_section_index = i;
+        else if (FDLFCN_strcmp(section_name, ".dynamic") == 0)
+            dynamic_section_index = i;
         else if (FDLFCN_strcmp(section_name, ".rela.dyn") == 0)
             rela_dyn_index = i;
         else if (FDLFCN_strcmp(section_name, ".rela.plt") == 0)
@@ -275,6 +356,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     void* data_section_data = NULL;
     void* rodata_section_data = NULL;
     void* symtab_str_section_data = NULL;
+    void* dynamic_section_data = NULL;
     void* base_address = NULL;
 
     size_t total_size = 0;
@@ -344,6 +426,13 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     else
         handle->relocations_plt = NULL;
 
+    if (dynamic_section_index != -1)
+    {
+        dynamic_section_data = fdl_load_section(filedata, &section_headers[dynamic_section_index], PROT_READ | PROT_WRITE);
+    }
+    else
+        handle->dynamic_section_data = NULL;
+
     handle->address = base_address;
     handle->size = total_size;
     handle->text_section_data = text_section_data;
@@ -357,6 +446,10 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     handle->rodata_section_data = rodata_section_data;
     handle->rodata_section_index = rodata_section_index;
     handle->rodata_section_header = &section_headers[rodata_section_index];
+    handle->dynamic_section_index = dynamic_section_index;
+    handle->dynamic_section_data = dynamic_section_data;
+    handle->init_array_section_index = init_array_section_index;
+    handle->fini_array_section_index = fini_array_section_index;
     handle->symtab_str_section_data = symtab_str_section_data;
     handle->symtab_str_section_header = &section_headers[symtab_str_section_index];
     handle->ehdr = elf_header;
@@ -367,20 +460,57 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
 
     if (fdl_apply_relocations(handle, reloc_section_index, rela_dyn_index, rela_plt_index) != 0)
     {
-        FDLFCN_printf("fdlopen: Relocation failed (%s:%d)\n", __FILE__, __LINE__);
+        fdl_debug("[FDL DEBUG] fdlopen: Relocation failed (%s:%d)\n", __FILE__, __LINE__);
         fdlclose(handle);
         return NULL;
     }
 
-    if (global_library_handles == NULL)
+    uint8_t has_dependencies = 0;
+
+    if (dynamic_section_index != -1)
     {
-        global_library_handles = handle;
+        Elf64_Dyn* dynamic_entries = handle->dynamic_section_data;
+        for (int i = 0; i < dynamic_entries[i].d_tag != DT_NULL; i++)
+        {
+            if (dynamic_entries[i].d_tag == DT_INIT)
+                ((void(*)(void))((uintptr_t)handle->address + dynamic_entries[i].d_un.d_ptr))();
+            else if (dynamic_entries[i].d_tag == DT_NEEDED)
+            {
+                has_dependencies = 1;
+                char* lib_name = (char*)((uintptr_t)handle->string_table_data + dynamic_entries[i].d_un.d_val);
+                fdl_debug("[FDL DEBUG] %s: Library %p depends on '%s' (%s:%d)\n", __FUNCTION__, handle, lib_name, __FILE__, __LINE__);
+            }
+        }
+    }
+
+    if (init_array_section_index != -1)
+    {
+        Elf64_Shdr init_array_section = handle->shdrs[init_array_section_index];
+        Elf64_Addr* init_array = (Elf64_Addr*)((uintptr_t)handle->address + init_array_section.sh_offset);
+
+        size_t count = init_array_section.sh_size / sizeof(Elf64_Addr);
+        for (size_t i = 0; i < count; i++)
+            ((void(*)(void))init_array[i])();
+    }
+
+    if (has_dependencies)
+    {
+        fdl_debug("[FDL DEBUG] %s: Dependency loading is currently not supported (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
+        fdlclose(handle);
+        return NULL;
+    }
+
+    fdl_debug("[FDL DEBUG] %s: Loaded library with base address %p (%s:%d)\n", __FUNCTION__, handle->address, __FILE__, __LINE__);
+
+    if (fdl_global_library_handles == NULL)
+    {
+        fdl_global_library_handles = handle;
     }
     else
     {
-        global_library_handles->prev = handle;
-        handle->next = global_library_handles;
-        global_library_handles = handle;
+        fdl_global_library_handles->prev = handle;
+        handle->next = fdl_global_library_handles;
+        fdl_global_library_handles = handle;
     }
 
     return handle;
