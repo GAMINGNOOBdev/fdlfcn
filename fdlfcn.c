@@ -1,5 +1,6 @@
 #include "fdlfcn.h"
 #include <elf.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #ifdef FDLFCN_DEBUGGING_SUPPORT
 #   include <stdarg.h>
@@ -232,7 +233,7 @@ int fdlclose(fdlfcn_handle* handle)
     if (handle->dynamic_section_index != -1)
     {
         Elf64_Dyn* dynamic_entries = handle->dynamic_section_data;
-        for (int i = 0; i < dynamic_entries[i].d_tag != DT_NULL; i++)
+        for (int i = 0; dynamic_entries[i].d_tag != DT_NULL; i++)
         {
             if (dynamic_entries[i].d_tag == DT_FINI)
                 ((void(*)(void))((uintptr_t)handle->address + dynamic_entries[i].d_un.d_ptr))();
@@ -254,8 +255,6 @@ int fdlclose(fdlfcn_handle* handle)
         FDLFCN_munmap(handle->string_table_data, handle->string_table_header->sh_size);
     if (handle->symtab_str_section_data)
         FDLFCN_munmap(handle->symtab_str_section_data, handle->symtab_str_section_header->sh_size);
-    if (handle->dynamic_section_data)
-        FDLFCN_munmap(handle->dynamic_section_data, handle->shdrs[handle->dynamic_section_index].sh_size);
     if (handle->relocations)
         FDLFCN_free(handle->relocations);
     if (handle->relocations_dyn)
@@ -318,6 +317,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     int reloc_section_index = -1;
     int symtab_str_section_index = -1;
     int dynamic_section_index = -1;
+    int dynamic_strtab_index = -1;
     int init_array_section_index = -1;
     int fini_array_section_index = -1;
     int rela_dyn_index = -1;
@@ -346,6 +346,8 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
             fini_array_section_index = i;
         else if (FDLFCN_strcmp(section_name, ".dynamic") == 0)
             dynamic_section_index = i;
+        else if (FDLFCN_strcmp(section_name, ".dynstr") == 0)
+            dynamic_strtab_index = i;
         else if (FDLFCN_strcmp(section_name, ".rela.dyn") == 0)
             rela_dyn_index = i;
         else if (FDLFCN_strcmp(section_name, ".rela.plt") == 0)
@@ -357,6 +359,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     void* rodata_section_data = NULL;
     void* symtab_str_section_data = NULL;
     void* dynamic_section_data = NULL;
+    void* dynamic_strtab_data = NULL;
     void* base_address = NULL;
 
     size_t total_size = 0;
@@ -383,8 +386,12 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
                 data_section_data = (void*)((uintptr_t)base_address + offset);
             else if (i == rodata_section_index)
                 rodata_section_data = (void*)((uintptr_t)base_address + offset);
-            offset += section_headers[i].sh_size;
+            else if (i == dynamic_section_index)
+                dynamic_section_data = (void*)((uintptr_t)base_address + offset);
+            else if (i == dynamic_strtab_index)
+                dynamic_strtab_data = (void*)((uintptr_t)base_address + offset);
         }
+        offset += section_headers[i].sh_size;
     }
 
     if (symtab_index != -1)
@@ -426,13 +433,6 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     else
         handle->relocations_plt = NULL;
 
-    if (dynamic_section_index != -1)
-    {
-        dynamic_section_data = fdl_load_section(filedata, &section_headers[dynamic_section_index], PROT_READ | PROT_WRITE);
-    }
-    else
-        handle->dynamic_section_data = NULL;
-
     handle->address = base_address;
     handle->size = total_size;
     handle->text_section_data = text_section_data;
@@ -448,6 +448,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     handle->rodata_section_header = &section_headers[rodata_section_index];
     handle->dynamic_section_index = dynamic_section_index;
     handle->dynamic_section_data = dynamic_section_data;
+    handle->dynamic_strtab_data = dynamic_strtab_data;
     handle->init_array_section_index = init_array_section_index;
     handle->fini_array_section_index = fini_array_section_index;
     handle->symtab_str_section_data = symtab_str_section_data;
@@ -460,7 +461,7 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
 
     if (fdl_apply_relocations(handle, reloc_section_index, rela_dyn_index, rela_plt_index) != 0)
     {
-        fdl_debug("[FDL DEBUG] fdlopen: Relocation failed (%s:%d)\n", __FILE__, __LINE__);
+        fdl_debug("[FDL DEBUG] %d: Relocation failed (%s:%d)\n", __FUNCTION__, __FILE__, __LINE__);
         fdlclose(handle);
         return NULL;
     }
@@ -470,15 +471,21 @@ fdlfcn_handle* fdlopen(void* filedata, int flags)
     if (dynamic_section_index != -1)
     {
         Elf64_Dyn* dynamic_entries = handle->dynamic_section_data;
-        for (int i = 0; i < dynamic_entries[i].d_tag != DT_NULL; i++)
+        for (int i = 0; dynamic_entries[i].d_tag != DT_NULL; i++)
         {
             if (dynamic_entries[i].d_tag == DT_INIT)
                 ((void(*)(void))((uintptr_t)handle->address + dynamic_entries[i].d_un.d_ptr))();
             else if (dynamic_entries[i].d_tag == DT_NEEDED)
             {
                 has_dependencies = 1;
-                char* lib_name = (char*)((uintptr_t)handle->string_table_data + dynamic_entries[i].d_un.d_val);
-                fdl_debug("[FDL DEBUG] %s: Library %p depends on '%s' (%s:%d)\n", __FUNCTION__, handle, lib_name, __FILE__, __LINE__);
+                if (handle->dynamic_strtab_data != NULL)
+                {
+                    Elf64_Xword rel_addr = dynamic_entries[i].d_un.d_val;
+                    char* lib_name = (char*)((uintptr_t)handle->dynamic_strtab_data + rel_addr);
+                    fdl_debug("[FDL DEBUG] %s: Library %p depends on '%s' (%s:%d)\n", __FUNCTION__, handle->address, lib_name, __FILE__, __LINE__);
+                }
+                else
+                    fdl_debug("[FDL DEBUG] %s: Library %p depends on something (%s:%d)\n", __FUNCTION__, handle->address, __FILE__, __LINE__);
             }
         }
     }

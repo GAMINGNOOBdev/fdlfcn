@@ -78,6 +78,7 @@ typedef struct fdlfcn_handle
     void* rodata_section_data;
     void* symtab_str_section_data;
     void* dynamic_section_data;
+    void* dynamic_strtab_data;
 
     Elf64_Shdr* text_section_header;
     Elf64_Shdr* string_table_header;
